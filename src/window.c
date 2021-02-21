@@ -696,12 +696,397 @@ apply_size_hints(client_t *c, uint16_t *width, uint16_t *height)
         baseh = c->size_hints.min_height;
     }
 
-    if (c->size_hits.flags & XCB_ICCCM_SIZE_HINT_P_MIN_SIZE) {
-        minw = c->size_hits.min_width;
+    if (c->size_hints.flags & XCB_ICCCM_SIZE_HINT_P_MIN_SIZE) {
+        minw = c->size_hints.min_width;
         minh = c->size_hints.min_height;
     } else if (c->size_hints.flags & XCB_ICCCM_SIZE_HINT_BASE_SIZE) {
         /* Min size is substituted with base size if not specified */
         minw = c->size_hints.base_width;
         minh = c->size_hints.base_height;
     }
+
+    /* Handle the size aspect ratio */
+    if (c->size_hints.flags & XCB_ICCCM_SIZE_HINT_P_ASPECT && c->size_hints.min_aspect_den > 0 &&
+        c->size_hints.max_aspect_den > 0 && *height > real_baseh && *width > real_basew) {
+            /**
+             * ICCCM:
+             * If a base size is provided along with the aspect ratio fields, the base size should
+             * be subtracted from the window size prior to checking that the aspect ratio falls
+             * in range. If a base size is not provided, nothing should be subtracted from the
+             * window size (the minimum size is not to be used in place of the base size for
+             * this purpose).
+            **/
+            double dx = *width - real_basew;
+            double dy = *height - real_baseh;
+            double ratio = dx / dy;
+            double min = c->size_hints.min_aspect_num / (double)c->size_hints.min_aspect_den;
+            double max = c->size_hints.max_aspect_num / (double)c->size_hints.max_aspect_den;
+
+            if (max > 0 && min > 0 && ratio > 0) {
+                if (ratio < min) {
+                    /* dx is lower than allowed, make lower to compensate this (+0.5 for rounding) */
+                    dy = dx / min + 0.5;
+                    *width = dx + real_basew;
+                    *height = dy + real_baseh;
+                } else if (ratio > max) {
+                    /* dx is too high, lower it (+0.5 for rounding) */
+                    dx = dy * max + 0.5;
+                    *width = dx + real_basew;
+                    *height = dy + real_baseh;
+                }
+            }
+
+            /* Handle the minimum size */
+            *width = MAX(*width, minw);
+            *height = MAX(*height, minh);
+
+            /* Handle the maximum size */
+            if (c->size_hints.flags & XCB_ICCCM_SIZE_HINT_P_MAX_SIZE) {
+                if (c->size_hints.max_width > 0)
+                    *width = MIN(*width, c->size_hints.max_width);
+
+                if (c->size_hints.max_height > 0)
+                    *height = MIN(*height, c->size_hints.max_height);
+            }
+
+            /* Handle the size increment */
+            if (c->size_hint.flags & (XCB_ICCCM_SIZE_HINT_P_RESIZE_INC |
+                XCB_ICCCM_SIZE_HINT_BASE_SIZE && c->size_hints.width_inc > 0 &&
+                c->size_hints.height_inc > 0)) {
+                uint16_t t1 = width, t2 = height;
+                unsigned_substract(t1, basew);
+                unsigned_substract(t2, baseh);
+
+                *width -= t1 % x->size_hints.width_inc;
+                *height -= t2 % c->size_hints.height_inc;
+            }
+    }
+}
+
+void
+query_pointer(xcb_window_t *win, xcb_point_t *pt)
+{
+    if (motion_recorder.enabled)
+        window_hide(motion_recorder.id);
+
+    xcb_query_pointer_reply_t *qpr = xcb_query_pointer_reply(dpy, xcb_query_pointer(dpy, root,
+        NULL));
+
+    if (qpr != NULL) {
+        if (win != NULL) {
+            if (qpr->child == XCB_NONE) {
+                xcb_point_t mpt = (xcb_point_t) { qpr->root_x, qpr->root_y };
+                monitor_t *m = monitor_from_point(mpt);
+
+                if (m != NULL) {
+                    desktop_t *d = m->desk;
+                    node_t *n;
+
+                    for (*n = first_extrema(d->root); n != NULL; n = next_leaf(n, d->root)) {
+                        if (n->client == NULL && is_inside(mpt, get_rectangle(m, d, n))) {
+                            *win = n->id;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                *win = qpr->child;
+                xcb_point_t pt = { qpr->root_x, qpr->root_y };
+                stacking_list_t *s;
+
+                for (*s = stack_tail; s != NULL; s = s->prev) {
+                    if (!s->node->client->shown || s->node->hidden)
+                        continue;
+
+                    xcb_rectangle_t rect = get_rectangle(NULL, NULL, s->node);
+
+                    if (is_inside(pt, rect)) {
+                        if (s->node->id == qpr->child || is_presel_window(qpr->child))
+                            *win = s->node->id;
+
+                        break;
+                    }
+                }
+            }
+
+            if (pt != NULL)
+                *pt = (xcb_point_t) { qpr->root_x, qpr->root_y };
+        }
+    }
+
+    free(qpr);
+
+    if (motion_recorder.enabled)
+        window_show(motion_recorder.id);
+}
+
+void
+update_motion_recorder(void)
+{
+    xcb_point_t pt;
+    xcb_window_t win = XCB_NONE;
+
+    query_ponter(&win, &pt);
+
+    if (win == XCB_NONE)
+        return;
+
+    monitor_t *m = monitor_from_point(pt);
+
+    if (m == NULL)
+        return;
+
+    desktop_t *d = m->desk;
+    node_t *n = NULL;
+
+    for (n = first_extrema(d->root); n != NULL; n = next_leaf(n, d->root)) {
+        if (n->id == win || (n->presel != NULL && n->presel->feedback == win))
+            break;
+    }
+
+    if ((n != NULL && n != mon->desk->focus) || (n == NULL && m != mon))
+        enable_motion_recorder(win);
+    else
+        disable_motion_recorder();
+}
+
+void
+enable_motion_recorder(xcb_window_t win)
+{
+    xcb_get_geometry_reply_t *geo = xcb_get_geometry_reply(dpy, xcb_get_geometry(dpy, win), NULL);
+
+    if (geo != NULL) {
+        uint16_t width = geo->width + 2 * geo->border_width;
+        uint16_t height = geo->height + 2 * geo->border_width;
+
+        window_move_resize(motion_recorder.id, geo->x, geo->y, width, height);
+        window_above(motion_recorder.id, win);
+        window_show(motion_recorder.id);
+
+        motion_recorder.enabled = true;
+    }
+
+    free(geo);
+}
+
+void
+disable_motion_recorder(void)
+{
+    if (!motion_recorder.enabled)
+        return;
+
+    window_hide(motion_recorder.id);
+    motion_recorder.enabled = false;
+}
+
+void
+window_border_width(xcb_window_t win, uint32_t bw)
+{
+    uint32_t values[] = { bw };
+
+    xcb_configure_window(dpy, win, XCB_CONFIG_WINDOW_BORDER_WIDTH, values);
+}
+
+void
+window_move(xcb_window_t win, int16_t x, int16_t y)
+{
+    uint32_t values[] = { x, y };
+
+    xcb_configure_window(dpy, win, XCB_CONFIG_WINDOW_X_Y, values);
+}
+
+void
+window_resize(xcb_window_t win, uint16_t w, uint16_t h)
+{
+    uint32_t values[] = { w, h };
+
+    xcb_configure_window(dpy, win, XCB_CONFIG_WINDOW_WIDTH_HEIGHT, values);
+}
+
+void
+window_move_resize(xcb_window_t win, int16_t x, int16_t y, uint16_t w, uint16_t h)
+{
+    uint32_t values[] = { x, y, w, h };
+
+    xcb_configure_window(dpy, win, XCB_CONFIG_WINDOW_X_Y_WIDTH_HEIGHT, values);
+}
+
+void
+window_center(monitor_t *m, client_t *c)
+{
+    xcb_rectangle_t *r = &c->floating_rectangle;
+    xcb_rectangle_t a = m->rectangle;
+
+    if (r->width >= a.width)
+        r->x = a.x;
+    else
+        r->x = a.x + (a.width - r->width) / 2;
+
+    if (r->height >= a.height)
+        r->y = a.y;
+    else
+        r->y = a.y + (a.height - r->height) / 2;
+
+    r->x -= c->border_width;
+    r->y -= c->border_width;
+}
+
+void
+window_stack(xcb_window_t w1, xcb_window_t w2, uint32_t mode)
+{
+    if (w2 == XCB_NONE)
+        return;
+
+    uint16_t mask = XCB_CONFIG_WINDOW_SIBLING | XCB_CONFIG_WINDOW_STACK_MODE;
+    uint32_t values[] = { w2, mode };
+    xcb_configure_window(dpy, w1, mask, values);
+}
+
+/* Stack w1 above w2 */
+void
+window_above(xcb_window_t w1, xcb_window_t w2)
+{
+    window_stack(w1, w2, XCB_STACK_MODE_ABOVE);
+}
+
+/* Stack w1 below w2 */
+void
+window_below(xcb_window_t w1, xcb_window_t w2)
+{
+    window_stack(w1, w2, XCB_STACK_MODE_BELOW);
+}
+
+void
+window_lower(xcb_window_t win)
+{
+    uint32_t values[] = { XCB_STACK_MODE_BELOW };
+
+    xcb_configure_window(dpy, win, XCB_CONFIGURE_WINDOW_STACK_MODE, values);
+}
+
+void
+window_set_visibility(xcb_window_t win, bool visible)
+{
+    uint32_t values_off[] = { ROOT_EVENT_MASK & ~XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY };
+    uint32_t values_on[] = { ROOT_EVENT_MASK };
+
+    xcb_change_window_attributes(dpy, root, XCB_CW_EVENT_MASK, values_off);
+
+    if (visible) {
+        set_window_state(win, XCB_ICCCM_WM_STATE_NORMAL);
+        xcb_map_window(dpy, win);
+    } else {
+        xcb_unmap_window(dpy, win);
+        set_window_state(win, XCB_ICCCM_WM_STATE_ICONIC);
+    }
+
+    xcb_change_window_attributes(dpy, root, XCB_CW_EVENT_MASK, values_on);
+}
+
+void
+window_hide(xcb_window_t win)
+{
+    window_set_visibility(win, false);
+}
+
+void
+window_show(xcb_window_t win)
+{
+    window_set_visibility(win, true);
+}
+
+void
+update_input_focus(void)
+{
+    set_input_focus(mon->desk->focus);
+}
+
+void
+set_input_focus(node_t *n)
+{
+    if (n == NULL || n->client == NULL) {
+        clear_input_focus();
+    } else {
+        if (n->client->icccm_props.input_hint)
+            xcb_set_input_focus(dpy, XCB_INPUT_FOCUS_PARENT, n->id, XCB_CURRENT_TIME);
+        else if (n->client->icccm_props.take_focus)
+            sent_client_message(n->id, ewmh->WM_PROTOCOLS, WM_TAKE_FOCUS);
+    }
+}
+
+void
+clear_input_focus(void)
+{
+    xcb_set_input_focus(dpy, XCB_INPUT_FOCUS_POINTER_ROOT, root, XCB_CURRENT_TIME);
+}
+
+void
+center_pointer(xcb_rectangle_t r)
+{
+    if (grabbing)
+        return;
+
+    int16_t cx = r.x + r.width / 2;
+    int16_t cy = r.y + r.height / 2;
+
+    xcb_warp_pointer(dpy, XCB_NONE, root, 0, 0, 0, 0, cx, cy);
+}
+
+void
+get_atom(char *name, xcb_atom_t *atom)
+{
+    xcb_intern_atom_reply_t *reply = xcb_intern_atom_reply(dpy, xcb_inter_atom(dpy, 0,
+        srlen(name), name), NULL);
+
+    if (reply != NULL)
+        *atom = reply->atom;
+    else
+        *atom = XCB_NONE;
+
+    free(reply);
+}
+
+void
+set_atom(xcb_window_t win, xcb_atom_t atom, uint32_t value)
+{
+    xcb_change_property(dpy, XCB_PROP_MODE_REPLACE, win, atom, XCB_ATOM_CARDINAL, 32, 1, &value);
+}
+
+void
+send_client_message(xcb_window_t win, xcb_atom_t property, xcb_atom_t value)
+{
+    xcb_client_message_event_t *e = calloc(32, 1);
+}
+
+void
+send_client_message(xcb_window_t win, xcb_atom_t property, xcb_atom_t value)
+{
+    xcb_client_message_event_t *e = calloc(32, 1);
+
+    e->response_type = XCB_CLIENT_MESSAGE;
+    e->window = win;
+    e->type = property;
+    e->format = 32;
+    e->data.data32[0] = value;
+    e->data.data32[1] = XCB_CURRENT_TIME;
+
+    xcb_send_event(dpy, false, win, XCB_EVENT_MASK_NO_EVENT, (char *)e);
+    xcb_flush(dpy);
+    free(e);
+}
+
+bool
+window_exists(xcb_window_t win)
+{
+    xcb_generic_error_t *err;
+
+    free(xcb_query_tree_reply(dpy, xcb_query_tree(dpy, win), &err));
+
+    if (err != NULL) {
+        free(err);
+
+        return false;
+    }
+
+    return true;
 }
