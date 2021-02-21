@@ -157,7 +157,7 @@ adapt_geometry(xcb_rectangle_t *rs, xcb_rectangle_t *rd, node_t *n)
 {
     node_t *f;
 
-    for (*f = first_extreme(n); f != NULL; f = next_leaf(f, n)) {
+    for (*f = first_extrema(n); f != NULL; f = next_leaf(f, n)) {
         if (c->client == NULL)
             continue;
     }

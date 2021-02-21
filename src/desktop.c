@@ -509,7 +509,7 @@ is_urgent(desktop_t *d)
 {
     node_t *n;
 
-    for (*n = first_extreme(d->root); n != NULL; n = next_leaf(n, d->root)) {
+    for (*n = first_extrema(d->root); n != NULL; n = next_leaf(n, d->root)) {
         if (n->client == NULL)
             continue;
 
