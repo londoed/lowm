@@ -1,6 +1,6 @@
 /**
  * Copyright (C) 2021, Eric Londo <londoed@comast.net>, { src/lopc.c }
- * This software is distributed under the GNU General Public License Version 2.1.
+ * This software is distributed under the GNU General Public License Version 2.0.
  * See the file LICENSE for details.
 **/
 #include <stdio.h>
