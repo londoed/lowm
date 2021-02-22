@@ -196,7 +196,7 @@ configure_request(xcb_generic_event_t *evt)
         xcb_configure_notify_event_t evt;
         unsigned int bw = c->border_width;
         xcb_rectangle_t r = IS_FULLSCREEN(c) ? loc.monitor->rectangle :
-            c->tiled_rectandle;
+            c->tiled_rectangle;
 
         evt.response_type = XCB_CONFIGURE_NOTIFY;
         evt.event = e->window;
