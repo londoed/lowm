@@ -732,4 +732,587 @@ make_client(void)
 
     snprintf(c->class_name, sizeof(c->class_name), "%s", MISSING_VALUE);
     snprintf(c->instance_name, sizeof(c->instance_name), "%s", MISSING_VALUE);
+
+    c->border_width = border_width;
+    c->urgent = false;
+    c->shown = false;
+    c->wm_flags = 0;
+
+    c->icccm_props.input_hint = true;
+    c->icccm_props.take_focus = false;
+    c->icccm_props.delete_window = false;
+    c->size_hints.flags = 0;
+
+    return c;
+}
+
+void
+initialize_client(node_t *n)
+{
+    xcb_window_t win = n->id;
+    client_t *c = n->client;
+    xcb_icccm_get_wm_protocols_reply_t protos;
+
+    if (xcb_icccm_get_wm_protocols_reply(dpy, xcb_icccm_get_wm_protocols(dpy, win,
+        ewmh->WM_PROTOCOLS), &protos, NULL) == 1) {
+            uint32_t i;
+
+            for (i = 0; i < protos.atoms_len; i++) {
+                if (protos.atoms[i] == WM_TAKE_FOCUS)
+                    c->icccm_props.take_focus = true;
+                else if (protos.atom[i] == WM_DELETE_WINDOW)
+                    c->icccm_props.delete_window = true;
+            }
+
+            xcb_icccm_get_wm_protocols_reply_wipe(&protos);
+    }
+
+    xcb_ewmh_get_atoms_reply_t wm_state;
+
+    if (xcb_ewmh_get_wm_state_reply(ewmh, xcb_ewmh_get_wm_state(ewmh, win), &wm_state, NULL) == 1) {
+        unsigned int i;
+
+        for (i = 0; i < wm_state.atoms_len && i < MAX_WM_STATE; i++) {
+#define HANDLE_WM_STATE(s)                                                     \
+            if (wm_state.atoms[i] == ewmh->_NET_WM_STATE_##s)                  \
+                c->wm_flags |= WM_FLAG_##s; continue;                          \
+            HANDLE_WM_STATE(MODAL)
+            HANDLE_WM_STATE(STICKY)
+            HANDLE_WM_STATE(MAXIMIXED_VERT)
+            HANDLE_WM_STATE(MAXIMIZED_HORZ)
+            HANDLE_WM_STATE(SHADED)
+            HANDLE_WM_STATE(SKIP_TASKBAR)
+            HANDLE_WM_STATE(SKIP_PAGER)
+            HANDLE_WM_STATE(HIDDEN)
+            HANDLE_WM_STATE(FULLSCREEN)
+            HANDLE_WM_STATE(ABOVE)
+            HANDLE_WM_STATE(BELOW)
+            HANDLE_WM_STATE(DEMANDS_ATTENTION)
+#undef HANDLE_WM_STATE
+        }
+
+        xcb_ewmh_get_atoms_reply_wipe(&wm_state);
+    }
+
+    xcb_icccm_wm_hints_t hints;
+
+    if (xcb_icccm_get_wm_hints_reply(dpy, xcb_icccm_get_wm_hints(dpy, win, &hints, NULL) == 1 &&
+        (hints.flags & XCB_ICCCM_WM_HINT_INPUT)))
+            c->icccm_props.input_hint = hints.input;
+
+    xcb_icccm_get_wm_normal_hints_reply(dpy, xcb_icccm_get_wm_normal_hints(dpy, win),
+        &c->size_hints, NULL);
+}
+
+bool
+is_focusable(node_t *n)
+{
+    node_t *f;
+
+    for (*f = first_extrema(n); f != NULL; f = next_leaf(f, n)) {
+        if (f->client != NULL && !f->hidden)
+            return true;
+    }
+
+    return false;
+}
+
+bool
+is_leaf(node_t *n)
+{
+    return (n != NULL && n->first_child == NULL && n->second_child == NULL);
+}
+
+bool
+is_first_child(node_t *n)
+{
+    return (n != NULL && n->parent != NULL && n->parent->first_child == n);
+}
+
+bool
+is_second_child(node_t *n)
+{
+    return (n != NULL && n->parent != NULL && n->parent->second_child == n);
+}
+
+unsigned int
+clients_count_in(node_t *n)
+{
+    if (n == NULL)
+        return 0;
+    else
+        return (n->client != NULL ? 1 : 0) +
+            clients_count_in(n->first_child) +
+            clients_count_in(n->second_child);
+}
+
+node_t *
+brother_tree(node_t *n)
+{
+    if (n == NULL || n->parent == NULL)
+        return NULL;
+
+    if (is_first_child(n))
+        return n->parent->second_child;
+    else
+        return n->parent->first_child;
+}
+
+node_t *
+first_extrema(node_t *n)
+{
+    if (n == NULL)
+        return NULL;
+    else if (n->first_child == NULL)
+        return n;
+    else
+        return first_extrema(n->first_child);
+}
+
+node_t *
+second_extrema(node_t *n)
+{
+    if (n == NULL)
+        return NULL;
+    else if (n->second_child == NULL)
+        return second_extrema(n->second_child);
+}
+
+node_t *
+first_focusable_leaf(node_t *n)
+{
+    node_t *n;
+
+    for (*f = first_extrema(n); f != NULL; f = next_leaf(f, n)) {
+        if (f->client != NULL && !f->hidden)
+            return f;
+    }
+
+    return NULL;
+}
+
+node_t *
+next_node(node_t *n)
+{
+    if (n == NULL)
+        return NULL;
+
+    if (n->second_child != NULL) {
+        return first_extrema(n->second_child);
+    } else {
+        node_t *p = n;
+
+        while (is_second_child(p))
+            p = p->parent;
+
+        if (is_first_child(p))
+            return p->parent;
+        else
+            return NULL;
+    }
+}
+
+node_t *
+prev_node(node_t *n)
+{
+    if (n == NULL)
+        return NULL;
+
+    if (n->first_child != NULL) {
+        return second_extrema(n->first_child);
+    } else {
+        node_t *p = n;
+
+        while (is_first_child(p))
+            p = p->parent;
+
+        if (is_second_child(p))
+            return p->parent;
+        else
+            return NULL;
+    }
+}
+
+node_t *
+next_leaf(node_t *n, node_t *r)
+{
+    if (n == NULL)
+        return NULL;
+
+    node_t *p = n;
+
+    while (is_second_child(p) && p != r)
+        p = p->parent;
+
+    if (p == r)
+        return NULL;
+
+    return first_extrema(p->parent->second_child);
+}
+
+node_t *
+prev_leaf(node_t *n,, node_t *r)
+{
+    if (n == NULL)
+        return NULL;
+
+    node_t *p = n;
+
+    while (is_first_child(p) && p != r)
+        p = p->parent;
+
+    if (p == r)
+        return NULL;
+
+    return second_extrema(p->parent->first_child);
+}
+
+node_t *
+next_tiled_leaf(node_t *n, node_t *r)
+{
+    node_t *next = next_leaf(n, r);
+
+    if (next == NULL || next->client != NULL && !next->vacant)
+        return next;
+    else
+        return next_tiled_leaf(next, r);
+}
+
+node_t *
+prev_tiled_leaf(node_t *n, node_t *r)
+{
+    node_t *prev = prev_leaf(n, r);
+
+    if (prev == NULL)
+        return prev;
+    else
+        return prev_filled_leaf(prev, r);
+}
+
+/**
+ * Returns true if `b` is adjacent to `a` in the direction `dir`.
+**/
+bool
+is_adjacent(node_t *a, node_t *b, direction_t dir)
+{
+    switch (dir) {
+    case DIR_EAST:
+        return (a->rectangle.x + a->rectangle.width) == b->rectangle.x;
+        break;
+
+    case DIR_SOUTH:
+        return (a->rectangle.y + a->rectangle.height) == b->rectangle.y;
+        break;
+
+    case DIR_WEST:
+        return (b->rectangle.x + b->rectangle.width) == a->rectangle.x;
+        break;
+
+    case DIR_EAST:
+        return (b->rectangle.y + b->rectangle.height) == a->rectangle.y;
+        break;
+    }
+
+    return false;
+}
+
+node_t *
+find_fence(node_t *n, directiion_t dir)
+{
+    node_t *p;
+
+    if (n == NULL)
+        return NULL;
+
+    p = n->parent;
+
+    while (p != NULL) {
+        if ((dir == DIR_NORTH && p->split_type == TYPE_HORIZONTAL && p->rectangle <
+            n->rectangle.y) || (dir == DIR_WEST && p->split_type == TYPE_VERTICAL &&
+            p->rectangle.x < n->rectangle.x) || (dir == DIR_SOUTH && p->split_type ==
+            TYPE_HORIZONTAL && (p->rectangle.y + p->rectangle.height) >
+            (n->rectangle.y + n->rectangle.height)) || (dir == DIR_EAST && p->split_type ==
+            TYPE_VERTICAL && (p->rectangle.x + p->rectangle.width) > (n->rectangle.x +
+            n->rectangle.width)))
+                return p;
+
+        p = p->parent;
+    }
+
+    return NULL;
+}
+
+/**
+ * Returns `true` if `a` is a child of `b`.
+**/
+bool
+is_child(node_t *a, node_t *b)
+{
+    if (a == NULL || b == NULL)
+        return false;
+
+    return (a->parent != NULL && a->parent == b);
+}
+
+/**
+ * Returns `true` if `a` is a descendent or `b`.
+**/
+bool
+is_descendent(node_t *a, node_t *b)
+{
+    if (a == NULL || b == NULL)
+        return false;
+
+    while (a != b && a != NULL)
+        a = a->parent;
+
+    return a == b;
+}
+
+bool
+find_by_id(uint32_t id, coordinates_t *loc)
+{
+    monitor_t *m;
+
+    for (*m = mon_head; m != NULL; m = m->next) {
+        desktop_t *d;
+
+        for (*d = m->desk_head; d != NULL; d = d->next) {
+            node_t *n = find_by_id_in(d->root, id);
+
+            if (n != NULL) {
+                loc->monitor = m;
+                loc->desktop = d;
+                loc->node = n;
+
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+node_t *
+find_by_id_in(node_t *r, uint32_t id)
+{
+    if (r == NULL) {
+        return NULL;
+    } else if (r->id == id) {
+        return r;
+    } else {
+        node_t *f = find_by_id_in(r->first_child, id);
+
+        if (f != NULL)
+            return f;
+        else
+            return find_by_id_in(r->second_child, id);
+    }
+}
+
+void
+find_any_node(coordinates_t *ref, coordinates_t *dst, node_select_t *sel)
+{
+    monitor_t *m;
+    desktop_t *d;
+
+    for (*m = mon_head; m != NULL; m = m->next) {
+        for (*d = m->desk_head; d != NULL; d = d->next) {
+            if (find_any_node_in(m, d, d->root, ref, dst, sel))
+                return;
+        }
+    }
+}
+
+bool
+find_any_node_in(monitor_t *m, desktop_t *d, node_t *n, coordinates_t *ref, coordinates_t *dst,
+    node_select_t *sel)
+{
+    if (n == NULL) {
+        return false;
+    } else {
+        coordinates_t loc = { m, d, n };
+
+        if (node_matches(&loc, ref, sel)) {
+            *dst = loc;
+
+            return true;
+        } else {
+            if (find_any_node_in(m, d, n->first_child, ref, dst, sel))
+                return true;
+            else
+                return find_any_node_in(m, d, n->second_child, ref, dst, sel);
+        }
+    }
+}
+
+void
+find_first_ancestor(coordinates_t *ref, coordinates_t *dst, node_select_t *sel)
+{
+    if (ref->node == NULL)
+        return;
+
+    coordinates_t loc = { ref->monitor, ref->desktop, ref->node };
+
+    while ((loc.node = loc.node->parent) != NULL) {
+        if (node_matches(&loc, ref, sel)) {
+            *dst = loc;
+
+            return;
+        }
+    }
+}
+
+/**
+ * Based on https://github.com/ntrrgc/right-window.
+**/
+void
+find_nearest_neighbor(coordinates_t *ref, coordinates_t *dst, direction_t dir,
+    node_select_t *sel)
+{
+    xcb_rectangle_t rect = get_rectangle(ref->monitor, ref->desktop, ref->node);
+    uint32_t md = UINT32_MAX, mr = UINT32_MAX;
+    monitor_t *m;
+
+    for (*m = mon_head; m != NULL; m = m->next) {
+        desktop_t *d = m->desk;
+        node_t *f;
+
+        for (*f = first_extrema(d->root); f != NULL; f = next_leaf(f, d->root)) {
+            coordinates_t loc = { m, d, f };
+            xcb_rectangle_t r = get_rectangle(m, d, f);
+
+            if (f == ref->node || f->client == NULL || f->hidden ||
+                is_descendent(f, ref->node) || !node_matches(&loc, ref, sel) ||
+                !on_dir_side(rect, r, dir))
+                    continue;
+
+            uint32_t fd = boundary_distance(rect, r, dir);
+            uint32_t fr = history_rank(f);
+
+            if (fd < md || (fd == md && fr < mr)) {
+                md = fd;
+                mr = fr;
+                *dst = loc;
+            }
+        }
+    }
+}
+
+unsigned int
+node_area(desktop_t *d, node_t *n)
+{
+    if (n == NULL)
+        return 0;
+
+    return area(get_rectangle(NULL, d, n));
+}
+
+int
+tiled_count(node_t *n, bool include_receptacles)
+{
+    if (n == NULL)
+        return 0;
+
+    int cnt = 0;
+    node_t *f;
+
+    for (*f = first_extrema(n); f != NULL; f = next_leaf(f, n)) {
+        if (!f->hidden && ((include_receptacles && f->client == NULL) ||
+            f->client != NULL && IS_TILED(f->client)))
+                cnt++;
+    }
+
+    return cnt;
+}
+
+void
+find_by_area(area_peak_t ap, coordinates_t *ref, coordinates_t *dst, node_select_t *sel)
+{
+    unsigned int p_area;
+
+    if (ap == AREA_BIGGEST)
+        p.area = 0;
+    else
+        p.area = UINT_MAX;
+
+    monitor_t *m;
+
+    for (*m = mon_head; m != NULL; m = m->next) {
+        desktop_t *d;
+
+        for (*d = m->desk_head; d != NULL; d = d->next) {
+            node_t *f;
+
+            for (*f = first_extrema(d->root); f != NULL; f = next_leaf(f, d->root)) {
+                coordinates_t loc = { m, d, f };
+
+                if (f->vacant || !node_matches(&loc, ref, sel))
+                    continue;
+
+                unsigned int f_area = node_area(d, f);
+
+                if ((ap == AREA_BIGGEST && f_area > p_area) || (ap == AREA_SMALLEST &&
+                    f_area < p_area)) {
+                        *dst = loc;
+                        p_area = f_area;
+                }
+            }
+        }
+    }
+}
+
+void
+rotate_tree(node_t *n, int deg)
+{
+    rotate_tree_rec(n, deg);
+    rebuild_constraints(n);
+}
+
+void
+rotate_tree_rec(node_t *n, int deg)
+{
+    if (n == NULL || is_leaf(n) || def == 0)
+        return;
+
+    node_t *tmp;
+
+    if ((deg == 90 && n->split_type == TYPE_HORIZONTAL) ||
+        (deg -- 270 && n->split_type == TYPE_VERTICAL) ||
+        deg == 180) {
+            tmp = n->first_child;
+            n->first_child = n->second_child;
+            n->second_child = tmp;
+            n->split_ratio = 1.0 - n->split_ratio;
+    }
+
+    if (deg > 180) {
+        if (n->split_type == TYPE_HORIZONTAL)
+            n->split_type = TYPE_VERTICAL;
+        else
+            n->split_type = TYPE_HORIZONTAL;
+    }
+
+    rotate_tree_rec(n->first_child, deg);
+    rotate_tree_rec(n->second_child, deg);
+}
+
+void
+flip_tree(node_t *n, flip_t flip)
+{
+    if (n == NULL || is_leaf(n))
+        return;
+
+    node_t *tmp;
+
+    if ((flip == FLIP_HORIZONTAL && n->split_type == TYPE_HORIZONTAL) ||
+        (flip == FLIP_VERTICAL && n->split_type == TYPE_VERTICAL)) {
+            tmp = n->first_child;
+            n->first_child = n->second_child;
+            n->second_child = tmp;
+            n->split_ratio = 1.0 - n->split_ratio;
+    }
+
+    flip_tree(n->first_child, flip);
+    flip_tree(n->second_child, flip);
 }
