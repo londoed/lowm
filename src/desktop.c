@@ -191,8 +191,8 @@ transfer_desktop(monitor_t *ms, monitor_t *md, desktop_t *d, bool follow)
         if (ms->desk != NULL) {
             transfer_sticky_nodes(md, d, ms, ms->desk, d->root);
         } else {
-            ms->stick_count -= sticky_count(d->root);
-            ms->stick_count += sticky_count(d->root);
+            ms->sticky_count -= sticky_count(d->root);
+            ms->sticky_count += sticky_count(d->root);
 
             if (d != md->desk)
                 transfer_sticky_nodes(md, d, md, md->desk, d->root);
@@ -366,7 +366,7 @@ bool
 swap_desktops(monitor_t *m1, desktop_t *d1, monitor_t *m2, desktop_t *d2, bool follow)
 {
     if (d1 == NULL || d2 == NULL || d1 == d2 || (m1->desk == d1 && m1->sticky_count > 0) ||
-        m2->desk == d2 && m2->stick_count > 0)
+        m2->desk == d2 && m2->sticky_count > 0)
             return false;
 
     put_status(SBSC_MASK_DESKTOP_SWAP, "desktop_swap 0x%08X 0x%08X 0x%08X 0x%08X\n",
