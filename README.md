@@ -1,4 +1,4 @@
-# # ![alt text](https://github.com/londoed/lowm/blob/main/images/lowm_logo.png|width=100px)
+<img src="https://github.com/londoed/lowm/blob/main/images/lowm_logo.png" width="100" />
 lowm is a hobby project to help me understand the nuts and bolts of window managers
 and display systems in Linux, while (hopefully) providing something useful to others
 in the process. At the moment, lowm will plan to work on X11 with the idea to
