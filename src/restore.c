@@ -1,7 +1,9 @@
 /**
- * Copyright (C) 2021, Eric Londo <londoed@comcast.net>, { src/restore.c }
+ * LOWM: An advanded tiling window manager for Linux.
+ *
+ * Copyright (C) 2021, Eric Londo <londoed@comcast.net>, { src/restore.c }.
  * This software is distributed under the GNU General Public License Version 2.0.
- * See the file LICENSE for details.
+ * Refer to the file LICENSE for additional details.
 **/
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +28,7 @@
 bool
 restore_state(const char *fpath)
 {
-    sie_t jslen;
+    size_t jslen;
     char *json = read_string(fpath, &jslen);
 
     if (json == NULL)
