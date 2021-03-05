@@ -1,0 +1,48 @@
+/**
+ * LOWM: An advanced tiling window manager for Unix.
+ *
+ * Copyright (C) 2021, Eric Londo <londoed@comcast.net>, { src/parse.h }.
+ * This software is distributed under the GNU General Public License Version 2.0.
+ * Refer to the file LICENSE for additional details.
+**/
+
+#ifndef LOWM_PARSE_H
+#define LOWM_PARSE_H
+
+#include <lowm/types.h>
+#include <lowm/subscribe.h>
+
+#define OPT_CHR '-'
+#define CAT_CHR '.'
+#define EQL_TOK '='
+#define COL_TOK ':'
+
+bool parse_bool(char *value, bool *b);
+bool parse_split_type(char *s, split_type_t *t);
+bool parse_split_mode(char *s, split_mode_t *m);
+bool parse_layout(char *s, layout_t *l);
+bool parse_client_state(char *s, client_state_t *t);
+bool parse_stack_layer(char *s, stack_layer_t *l);
+bool parse_direction(char *s, direction_t *d);
+bool parse_cycle_direction(char *s, cycle_dir_t *d);
+bool parse_circulate_direction(char *s, circulate_dir_t *d);
+bool parse_history_direction(char *s, history_dir_t *d);
+bool parse_flip(char *s, flip_t *f);
+bool parse_resize_handle(char *s, resize_handle_t *h);
+bool parse_modifier_mask(char *s, uint16_t *m);
+bool parse_button_index(char *s, int8_t *b);
+bool parse_pointer_action(char *s, pointer_action_t *a);
+bool parse_child_polarity(char *s, child_polarity_t *p);
+bool parse_automatic_scheme(char *s, automatic_scheme_t *a);
+bool parse_state_transition(char *s, state_transition_t *m);
+bool parse_tightness(char *s, tightness_t *t);
+bool parse_degree(char *s, int *d);
+bool parse_id(char *s, uint32_t *id);
+bool parse_bool_declaration(char *s, char **key, bool *value, alter_state_t *state);
+bool parse_index(char *s, uint16_t *idx);
+bool parse_subscriber_mask(char *s, subscriber_mask_t *mask);
+bool parse_monitor_modifiers(char *desc, monitor_select_t *sel);
+bool parse_desktop_modifiers(char *desc, desltop_select_t *sel);
+bool parse_node_modifiers(char *desc, node_select_t *sel);
+
+#endif
