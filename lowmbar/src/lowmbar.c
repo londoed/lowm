@@ -1379,5 +1379,277 @@ init(char *wm_name)
 		monhead = monitor_new(0, 0, bw, scr->height_in_pixels, NULL);
 	}
 
+	if (!monhead)
+		exit(EXIT_FAILURE);
+
+	set_ewmh_atoms();
+	
+	gc[GC_DRAW] = xcb_generate_id(c);
+	xcb_create_gc(c, gc[GC_DRAW], monhead->pixmap, XCB_GC_FOREGROUND, (const uint32_t[]){ fgc.v });
+	gc[GC_CLEAR] = xcb_generate_id(c);
+	xcb_create_gc(c, gc[GC_CLEAR], monhead->pixmap, XCB_GC_FOREGROUND, (const uint32_t[]){ bgc.v });
+	gc[GC_ATTR] = xcb_generate_id(c);
+	xcb_create_gc(c, gc[GC_ATTR], monhead->pixmap, XCB_GC_FOREGROUND, (const uint32_t[]){ ugc.v });
+
+	for (monitor_t *mon = monhead; mon; mon = mon->next) {
+		fill_rect(mon->pixmap, gc[GC_CLEAR], 0, 0, mon->width, bh);
+		xcb_map_window(c, mon->window);
+		xcb_configure_window(c, mon->window, XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y,
+			(const uint32_t[]){ mon->x, mon->y });
+
+		if (wm_name)
+			xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING,
+				8, strlen(wm_name), wm_name);
+	}
+
+	xcb_flush(c);
+}
+
+void
+cleanup(void)
+{
+	int i;
+
+	for (i = 0; i < num_output; i++)
+		free(output_names[i]);
+
+	free(output_names);
+	free(area_stack.ptr);
+
+	for (i = 0; i < font_count; i++) {
+		xcb_close_font(c, font_list[i]->ptr);
+		free(font_list[i]->width_lut);
+		free(font_list[i]);
+	}
+
+	free(font_list);
+
+	while (monhead) {
+		monitor_t *next = monhead->next;
+		xcb_destroy_window(c, monhead->window);
+		xcb_free_pixmap(c, monhead->pixmap);
+		free(monhead->name);
+		free(monhead);
+		monhead = next;
+	}
+
+	xcb_free_colormap(c, colormap);
+
+	if (gc[GC_DRAW])
+		xcb_free_gc(c, gc[GC_DRAW]);
+
+	if (gc[GC_CLEAR])
+		xcb_free_gc(c, gc[GC_CLEAR]);
+
+	if (gc[GC_ATTR])
+		xcb_free_gc(c, gc[GC_ATTR]);
+
+	if (c)
+		xcb_disconnect(c);
+}
+
+int
+main(int argc, char **argv)
+{
+	struct pollfd_pollin[2] = {
+		{ .fd = STDIN_FILENO, .events = POLLIN },
+		{ .fd = -1, .events = POLLIN },
+	};
+
+	xcb_generic_event_t *ev;
+	xcb_expose_event_t *expose_ev;
+	xcb_button_press_event_t *press_ev;
+	char input[4096] = { 0, };
+	size_t input_offset = 0;
+	bool permanent = false;
+	int geom_v[4] = { -1, -1, 0, 0 };
+	int ch;
+	char *wm_name;
+
+	atexit(cleanup);
+	signal(SIGINT, sighandle);
+	signal(SIGTERM, sighandle);
+
+	dbgc = bgc = BLACK;
+	dfgc = fgc = WHITE;
+	dugc = ugc = fgc;
+	wm_name = NULL;
+	xconn();
+
+	while ((ch = getopt(argc, argv, "hg:o:bdf:a:pu:B:F:U:n")) != -1) {
+		switch (ch) {
+		case 'h':
+			printf("lowmbar version %s\n", LOWMBAR_VERSION);
+			printf("[!] USAGE: %s [-h | -g | -o | -b | -d | -f | -p | -n | -u | -B | -F]\n"
+				"\t-h Show this help\n"
+				"\t-g Set the bar geometry {width}x{height}+{xoffset}+{yoffset}\n"
+				"\t-o Add randr output by name\n"
+				"\t-b Put the bar at the bottom of the screen\n"
+				"\t-d Force docking (use this if your WM isn't EWMH compliant)\n"
+				"\t-f Set the font name to use\n"
+				"\t-p Don't close after the data ends\n"
+				"\t-n Set the WM_NAME atom to the specified value for this bar\n"
+				"\t-u Set teh underline/overline height in pixels\n"
+				"\t-B Set background color in #AARRGGBB\n"
+				"\t-F Set foreground color in #AARRGGBB\n", argv[0]);
+			exit(EXIT_SUCCESS);
+
+		case 'g':
+			(void)parse_geometry_string(optarg, geom_v);
+			break;
+
+		case 'o':
+			(void)parse_output_string(optarg);
+			break;
+
+		case 'p':
+			permanent = true;
+			break;
+
+		case 'n':
+			wm_name = strdup(optarg);
+			break;
+
+		case 'b':
+			topbar = false;
+			break;
+
+		case 'd':
+			dock = true;
+			break;
+
+		case 'f':
+			font_load(optarg);
+			break;
+
+		case 'u':
+			bu = strtoul(optarg, NULL, 10);
+			break;
+
+		case 'B':
+			dbgc = bgc = parse_color(optarg, NULL, BLACK);
+			break;
+
+		case 'F':
+			dfgc = fgc = parse_color(optarg, NULL, WHITE);
+			break;
+
+		case 'U':
+			dugc = ugc = parse_color(optarg, NULL, fgc);
+			break;
+		}
+	}
+
+	area_stack.index = 0;
+	area_stack.alloc = 10;
+	area_stack.ptr = calloc(10, sizeof(area_t));
+
+	if (!area_stack.ptr) {
+		lowm_err("[!] ERROR: lowmbar: Failed to allocate enough input areas\n");
+
+		return EXIT_FAILURE;
+	}
+
+	bw = geom_v[0];
+	bh = geom_v[1];
+	bx = geom_v[2];
+	by = geom_v[3];
+
+	init(wm_name);
+	free(wm_name);
+	pollin[1].fd = xcb_get_file_descriptor(c);
+
+	for (;;) {
+		bool redraw = false;
+
+		if (xcb_connection_has_error(c))
+			break;
+
+		if (poll(pollin, 2, -1) > 0) {
+			if (pollin[0].revents & POLLHUP) {
+				if (permanent)
+					pollin[0].fd = -1;
+				else
+					break;
+			}
+
+			if (pollin[0].revents & POLLIN) {
+				for (;;) {
+					ssize_t r = read(STDIN_FILENO, input + input_offset, sizeof(input) - input_offset);
+
+					if (r == 0)
+						break;
+
+					if (r < 0) {
+						if (errno == EINTR)
+							continue;
+
+						exit(EXIT_FAILURE);
+					}
+
+					input_offset += r;
+					char *input_end = input + input_offset;
+					char *last_nl = memchr(input, '\n', input_end - input);
+
+					if (last_nl) {
+						char *prev_nl = (last_nl != input) ? memchr(input, '\n', last_nl - 1 - input) : NULL;
+						char *begin = prev_nl ? prev_nl + 1 : input;
+
+						*last_nl = '\0';
+						parse(begin);
+						redraw = true;
+						const size_t remaining = input_end - (last_nl + 1);
+
+						if (remaining != 0)
+							memmove(input, last_nl + 1, remaining);
+						
+						input_offset = remaining;
+						break;
+					}
+
+					if (sizeof(input) == input_offset)
+						input_offset = 0;
+				}
+			}
+
+			if (pollin[1].revents & POLLIN) {
+				while ((ev = xcb_pol_for_event(c))) {
+					expose_ev = (xcb_expose_event_t *)ev;
+
+					switch (ev->respone_type & 0x7f) {
+					case XCB_EXPOSE:
+						if (expose_ev->count == 0)
+							redraw = true;
+
+						break;
+
+					case XCB_BUTTON_PRESS:
+						press_ev = (xcb_button_press_event_t *)evl;
+						{
+							area_t *area = area_get(press_ev->event, press_ev->detail, press_ev->event_x);
+
+							if (area) {
+								(void)write(STDOUT_FILENO, area->cmd, strlen(area->cmd));
+								(void)write(STDOUT_FILENO, "\n", 1);
+							}
+						}
+
+						break;
+					}
+
+					free(ev);
+				}
+			}
+		}
+
+		if (redraw) {
+			for (monitor_t *mon = monhead; mon; mon = mon->next)
+				xcb_copy_area(c, mon->pixmap, mon->window, gc[GC_DRAW], 0, 0, 0, 0, mon->width, bh);
+		}
+
+		xcb_flush(c);
+	}
+
+	return EXIT_SUCCESS;
 }
 
