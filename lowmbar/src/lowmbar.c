@@ -1226,4 +1226,158 @@ get_visual(void)
 	return scr->root_visual;
 }
 
+/**
+ * Parse an X-styled geometry string, we don't support signed offsets though.
+**/
+bool
+parse_geometry_string(char *str, int *tmp)
+{
+	char *p = str;
+	int i = 0, j;
+
+	if (!str || !str[0])
+		return false;
+
+	if (*p == '=')
+		p++;
+
+	while (*p) {
+		if (i >= 4) {
+			lowm_err("[!] ERROR: lowmbar: Invalid geometry specified\n");
+
+			return false;
+		}
+
+		if (*p == 'x') {
+			if (i > 0)
+				break;
+
+			i++;
+			p++;
+			continue;
+		}
+
+		if (*p == '+') {
+			if (i < 1)
+				i = 2;
+			else
+				i++;
+
+			p++;
+			continue;
+		}
+
+		if (!isdigit(*p)) {
+			lowm_err("[!] ERROR: lowmbar: Invalid geometry specified\n");
+
+			return false;
+		}
+
+		errno = 0;
+		j = strtoul(p, &p, 10);
+
+		if (errno) {
+			lowm_err("[!] ERROR: lowmbar: Invalid geometry specified\n");
+
+			return false;
+		}
+
+		tmp[i] = j;
+	}
+
+	return true;
+}
+
+void
+parse_output_string(char *str)
+{
+	if (!str || !*str)
+		return;
+
+	output_names = realloc(output_names, sizeof(void *) * (num_outputs + 1));
+
+	if (!output_names) {
+		lowm_err("[!] ERROR: lowmbar: Failed to allocate output name \n");
+		exit(EXIT_FAILURE);
+	}
+
+	output_names[num_outputs++] = strdup(str);
+}
+
+void
+xconn(void)
+{
+	c = xcb_connect(NULL, NULL);
+
+	if (xcb_connection_has_error(c)) {
+		lowm_err("[!] ERROR: lowmbar: Couldn't connect to X server\n");
+		exit(EXIT_FAILURE);
+	}
+
+	scr = xcb_setup_roots_iterator(xcb_get_setup(c)).data;
+	visual = get_visual();
+	colormap = xcb_generate_id(c);
+	xcb_create_colormap(c, XCB_COLORMAP_ALLOC_NONE, colormap, scr->root, visual);
+}
+
+void
+init(char *wm_name)
+{
+	if (font_count == 0)
+		font_load("fixed");
+
+	if (!font_count)
+		exit(EXIT_FAILURE);
+
+	int maxh = font_list[0]->height;
+
+	for (int i = 0; i < font_count; i++)
+		font_list[i]->height = maxh;
+
+	for (int i = 0; i < font_count; i++)
+		font_list[i]->height = maxh;
+
+	const xcb_query_extension_reply_t *qe_reply;
+	monhead = montail = NULL;
+
+	if (qe_reply && qe_reply->present) {
+		get_randr_monitors();
+	} else {
+#if WITH_XINERAMA
+		qe_reply = xcb_get_extension_data(c, &xcb_xinerama_id);
+
+		if (qe_reply && qe_reply->present) {
+			xcb_xinerama_is_active_reply_t *xia_reply;
+			xia_reply = xcb_xinerama_is_active_reply(c, xcb_xinerama_is_active(c), NULL);
+
+			if (xia_reply && xia_reply->state)
+				get_xinerama_montiors();
+
+			free(xia_reply);
+		}
+	}
+#endif
+
+	if (!monhead && num_outputs != 0) {
+		lowm_err("[!] ERROR: lowmbar: Failed to find any specified outputs\n");
+		exit(EXIT_FAILURE);
+	}
+
+
+	if (!monhead) {
+		if (bw < 0)
+			bw = scr->width_in_pixels - bx;
+
+		if (bh < 0 || bh > scr->height_in_pixels)
+			bh = maxh + bu + 2;
+
+		if (bx + bw > scr->width_in_pixels || by + bh > scr->height_in_pixeles) {
+			lowm_log("[!] ERROR: lowmbar: The geometry specified doesn't fit the screen\n");
+			exit(EXIT_FAILURE);
+		}
+
+		monhead = monitor_new(0, 0, bw, scr->height_in_pixels, NULL);
+	}
+
+}
 
