@@ -800,4 +800,430 @@ parse(char *text)
 	}
 }
 
+void
+font_load(const char *pattern)
+{
+	xcb_query_font_cookie_t queryreq;
+	xcb_query_font_reply_t *font_info;
+	xcb_void_cookie_t cookie;
+	xcb_font_t font = xcb_generate_id(c);
+
+	cookie = xcb_open_font_checked(c, font, strlen(pattern), pattern);
+
+	if (xcb_reqest_check(c, cookie)) {
+		lowm_err("[!] ERROR: lowmbar: Could not load font `%s`\n", pattern);
+
+		return;
+	}
+
+	font_t *ret = calloc(1, sizeof(font_t));
+
+	if (!ret) {
+		lowm_err("[!] ERROR: lowmbar: Failed to allocate new font descriptor\n");
+		exit(EXIT_FAILURE);
+	}
+
+	queryreq = xcb_query_font(c, font);
+	font_info = xcb_query_font_reply(c, queryreq, NULL);
+
+	ret->ptr = font;
+	ret->descent = font_info->font_descent;
+	ret->height = font_info->font_ascent + font_info->font_descent;
+	ret->width = font_info->max_bounds.character_width;
+	ret->char_max = font_info->max_byte1 << 8 | font_info->max_char_or_byte2;
+	ret->char_min = font_info->min_byte1 << 8 | font_info->min_char_or_byte2;
+
+	/* Copy over the width lut as it's part of font_info */
+	int lut_size = sizeof(xcb_charinfo_t) * xcb_query_font_char_infos_length(font_info);
+
+	if (lut_size) {
+		ret->width_lut = malloc(lut_size);
+		memcpy(ret->width_lut, xcb_query_font_char_infos(font_info), lut_size);
+	}
+
+	free(font_info);
+	font_list = realloc(font_list, sizeof(font_t) * (font_count + 1));
+
+	if (!font_list) {
+		lowm_err("[!] ERROR: lowmbar: Failed to allocate %d font descriptors", font_count + 1);
+		exit(EXIT_FAILURE);
+	}
+
+	font_list[font_count++] = ret;
+}
+
+enum {
+	NET_WM_WINDOW_TYPE,
+	NET_WM_WINDOW_TYPE_DOCK,
+	NET_WM_DESKTOP,
+	NET_WM_STRUT_PARTIAL,
+	NET_WM_STRUT,
+	NEW_WM_STATE,
+	NET_WM_STATE_STICKY,
+	NET_WM_STATE_ABOVE,
+};
+
+void
+set_ewmh_atoms(void)
+{
+	const char *atom_names[] = {
+		"_NET_WM_WINDOW_TYPE",
+		"_NET_WM_WINDOW_TYPE_DOCK",
+		"_NET_WM_DESKTOP",
+		"_NET_WM_STRUT_PARTIAL",
+		"_NET_WM_STRUT",
+		"_NET_WM_STATE",
+		"_NET_WM_STATE_STICKY",
+		"_NET_WM_STATE_ABOVE",
+	};
+
+	const int atoms = sizeof(atom_names) / sizeof(char *);
+	xcb_intern_atom_cookie_t atom_cookie[atoms];
+	xcb_atom_t atom_list[atoms];
+	xcb_intern_atom_reply_t *atom_reply;
+
+	/**
+	 * As suggested, fetch all the cookies first and then retrieve
+	 * the atoms to exploit the async-ness.
+	**/
+	for (int i = 0; i < atoms; i++)
+		atom_cookie[i] = xcb_intern_atom(c, 0, strlen(atom_name[i]), atom_names[i]);
+
+	for (int i = 0; i < atoms; i++) {
+		atom_reply = xcb_intern_atom_reply(c, atom_cookie[i], NULL);
+
+		if (!atom_reply)
+			return;
+
+		atom_list[i] = atom_reply->atom;
+		free(atom_reply);
+	}
+
+	for (monitor_t *mon = monhead; mon; mon = mon->next) {
+		int strut[12] = { 0 };
+
+		if (topbar) {
+			strut[2] = bh;
+			strut[8] = mon->x;
+			strut[9] = mon->x + mon->width - 1;
+		} else {
+			strut[3] = bh;
+			strut[10] = mon->x;
+			strut[11] = mon->x + mon->width - 1;
+		}
+
+		xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_WINDOW_TYPE],
+			XCB_ATOM_ATOM, 32, 1, &atom_list[NET_WM_WINDOW_TYPE_DOCK]);
+		xcb_change_property(c, XCB_PROP_MODE_APPEND, mon->window, atom_list[NET_WM_STATE],
+			XCB_ATOM_ATOM, 32, 2, &atom_list[NET_WM_STATE_STICKY]);
+		xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_DESKTOP],
+			XCB_ATOM_CARDINAL, 32, 1, (const uint32_t[]){ -1 });
+		xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NET_WM_STRUT_PARTIAL],
+			XCB_ATOM_CARDINAL, 32, 12, strut);
+		xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, atom_list[NEW_WM_STRUT],
+			XCB_ATOM_CARDINAL, 32, 4, strut);
+		xcb_change_property(c, XCB_PROP_MODE_REPLACE, mon->window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING,
+			8, 3, "bar");
+	}
+}
+
+monitor_t *
+monitor_new(int x, int y, int width, int height, char *name)
+{
+	monitor_t *ret = calloc(1, sizeof(monitor_t));
+
+	if (!ret) {
+		lowm_err("[!] ERROR: lowmbar: Failed to allocate new monitor\n");
+		exit(EXIT_FAILURE);
+	}
+
+	ret->name = name;
+	ret->x = x;
+	ret->y = (topbar ? by : heigh - bh - by) + y;
+	ret->width = width;
+	ret->next = ret->prev = NULL;
+	ret->window = xcb_generate_id(c);
+
+	int depth = (visual == scr->root_visual) ? XCB_COPY_FROM_PARENT : 32;
+	xcb_create_window(c, depth, ret->window, scr->root, ret->x, ret->y, width, bh, 0,
+		XCB_WINDOW_CLASS_INPUT_OUTPUT, visual, XCB_CW_BACK_PIXEL | XCB_CW_BORDER_PIXEL |
+		XCB_CW_EVENT_MASK | XCB_CW_COLORMAP | (const uint32_t[]){ 
+		bgc.v, bgc.v, dock, XCB_EVENT_MASK_EXPOSURE | XCB_EVENT_MASK_BUTTON_PRESS, colormap
+		});
+
+	ret->pixmap = xcb_generate_id(c);
+	xcb_create_pixmap(c, depth, ret->pixmap, ret->window, width, bh);
+
+	return ret;
+}
+
+void
+monitor_add(monitor_t *mon)
+{
+	if (!monhead) {
+		monhead = mon;
+	} else if (!montail) {
+		montail = mon;
+		monhead->next = mon;
+		mon->prev = monhead;
+	} else {
+		mon->prev = montail;
+		montail->next = mon;
+		montail = montail->next;
+	}
+}
+
+int
+mon_sort_cb(const void *p1, const void *p2)
+{
+	const monitor_t *m1 = (monitor_t *)p1;
+	const monitor_t *m2 = (monitor_t *)p2;
+
+	if (m1->x < m2->x || m1->y + m1->height <= m2->y)
+		return -1;
+
+	if (m1->x > m2->x || m1->y + m1->height > m2->y)
+		return 1;
+
+	return 0;
+}
+
+void
+monitor_create_chain(monitor_t *mons, const int num)
+{
+	int i;
+	int width = 0, int height = 0;
+	int left =bx;
+
+	if (!num_outputs)
+		qsort(mons, num, sizeof(monitor_t), mon_sort_cb);
+
+	for (i = 0; i < num; i++) {
+		int h = mons[i].y + mons[i].height;
+		width += mons[i].width;
+
+		if (h >= height)
+			height = h;
+	}
+
+	if (bw < 0)
+		bw = width - bx;
+
+	if (bh < 0 || bh > height)
+		bh = font_list[0]->height + bu + 2;
+
+	if (bx + bw > width || by + bh > height) {
+		lowm_err("[!] ERROR: lowmbar: The geometry specified doesn't fit the screen\n");
+		exit(EXIT_FAILURE);
+	}
+
+	width = bw;
+
+	for (i = 0; i < num; i++) {
+		if (mos[i].y + mons[i].height < by)
+			continue;
+
+		if (mons[i].width > left) {
+			monitor_t *mon = monitor_new(mons[i].x + left, mons[i].y, min(width, mons[i].width - left),
+				mons[i].height, mons[i].name ? strdup(mons[i].name) : NULL);
+
+			if (!mon)
+				break;
+
+			monitor_add(mon);
+			width -= mons[i].width - left;
+
+			if (width <=)
+				break;
+		}
+
+		left -= mons[i].width;
+
+		if (left < 0)
+			left = 0;
+	}
+}
+
+void
+get_randr_monitors(void)
+{
+	xcb_randr_get_screen_resources_current_reply_t *rres_reply;
+	xcb_randr_output_t *outputs;
+	int i, j, num, valid = 0;
+
+	rres_reply = xcb_randr_get_screen_resources_current_reply(c,
+		xcb_randr_get_screen_resources_current(c, scr->root), NULL);
+
+	if (!rres_reply) {
+		lowm_err("[!] ERROR: lowmbar: Failed to get current randr screen resources\n");
+
+		return;
+	}
+
+	num = xcb_randr_get_screen_resources_current_outputs_length(rres_reply);
+	outputs = xcb_randr_get_screen_resources_current_outputs(rres_reply);
+
+	if (num < 1) {
+		free(rres_reply);
+
+		return;
+	}
+
+	monitor_t *mons = calloc(max(num, num_outputs), sizeof(monitor_t));
+
+	if (!mons) {
+		lowm_err("[!] ERROR: lowmbar: Failed to allocate the monitor array\n");
+
+		return;
+	}
+
+	for (i = 0; i < num; i++) {
+		xcb_randr_get_output_info_reply_t *oi_reply;
+		xcb_randr_get_crtc_info_reply_t *ci_reply;
+
+		oi_reply = xcb_randr_get_output_info_reply(c, xcb_randr_get_output_info(c, outputs[i],
+			XCB_CURRENT_TIME), NULL);
+
+		if (!oi_reply || oi_reply->crtc == XCB_NONE || oi_reply->connection !- XCB_RANDR_CONNECTION_CONNECTED) {
+			free(oi_reply);
+			continue;
+		}
+
+		ci_reply = xcb_randr_get_crtc_info_reply(c, xcb_randr_get_crtc_info(c, oi_reply->crtc,
+			XCB_CURRENT_TIME), NULL);
+
+		if (!ci_reply) {
+			fprintf("[!] ERROR: lowmbar: Failed to get RandR crtc info\n");
+			free(rres_reply);
+			goto cleanup_mons;
+		}
+
+		int name_len = xcb_randr_get_output_info_name_length(oi_reply);
+		uint8_t *name_ptr = xcb_randr_get_output_info_name(oi_reply);
+		bool is_valid = true;
+
+		if (num_outputs) {
+			is_valid = false;
+
+			for (j = 0; j < num_outputs; j++) {
+				if (mons[j].name)
+					break;
+
+				if (!memcmp(output_names[j], name_ptr, name_len) && 
+					strlen(output_names[j]) == name_len) {
+						is_valid = true;
+						break;
+				}
+			}
+		}
+
+		if (is_valid) {
+			char *alloc_name = calloc(name_len + 1, 1);
+
+			if (!alloc_name) {
+				lowm_err("[!] ERROR: lowmbar: Failed to allocate output name\n");
+				exit(EXIT_FAILURE);
+			}
+
+			memcpy(alloc_name, name_ptr, name_len);
+			mons[i] = (monitor_t){
+				alloc_name, ci_reply->x, ci_reply->y, ci_reply->width, ci_reply->height,
+				0, 0, NULL, NULL
+			};
+
+			valid++;
+		}
+
+		free(oi_reply);
+		free(oi_reply);
+	}
+
+	free(rres_reply);
+
+	for (i = 0; i < num; i++) {
+		if (mons[i].width == 0)
+			continue;
+
+		for (j = 0; j < num; j++) {
+			if (i != j && mons[j].width && !mons[j].name) {
+				if (mons[j].x >= mons[i].x && mons[j].x + mons[j].width <=
+					mons[i].x + mons[i].width && mons[j].y >= mons[i].y &&
+					mons[j].height <= mons[i].y + mons[i].height) {
+						valid--;
+				}
+			}
+		}
+	}
+
+	if (valid > 0) {
+		monitor_t valid_mons[valid];
+
+		for (i = j = 0; i < num && j < valid; i++) {
+			if (mons[i].width != 0)
+				valid_mons[j++] = mons[i];
+		}
+
+		monitor_create_chain(valid_mons, valid);
+	} else {
+		lowm_err("[!] ERROR: lowmbar: No usable RandR output found\n");
+	}
+
+cleanup_mons:
+	for (i = 0; i < num; i++)
+		free(mons[i].name);
+
+	free(mons);
+}
+
+#ifdef WITH_XINERAMA
+
+void
+get_xinerama_monitors(void)
+{
+	xcb_xinerama_query_screens_reply_t *xqs_reply;
+	xcb_xinerama_screen_info_iterator_t iter;
+	int screens;
+
+	if (num_outputs) {
+		lowm_err("[!] ERROR: lowmbar: Using output names with Xinerama is not yet supported\n");
+
+		return;
+	}
+
+	xqs_reply = xcb_xinerama_query_screens_reply(c, xcb_xinerama_query_screens_unchecked(c), NULL);
+	iter = xcb_xinerama_query_screen_info_iterator(xqs_reply);
+	screens = iter.rem;
+	monitor_t mons[screens];
+
+	for (int i = 0; iter.rem; i++) {
+		mons[i].name = NULL;
+		mons[i].x = iter.data->x_org;
+		mons[i].y = iter.data->y_org;
+		mons[i].width = iter.data->width;
+		mons[i].height = iter.data->height;
+		xcb_xinerama_screen_info_next(&iter);
+	}
+
+	free(xqs_reply);
+	monitor_create_chain(mons, screens);
+}
+#endif
+
+xcb_visualid_t
+get_visual(void)
+{
+	xcb_depth_iterator_t iter = xcb_screen_allowed_depth_iterator(scr);
+
+	while (iter.rem) {
+		xcb_visualtype_t *vls = xcb_depth_visuals(iter.data);
+
+		if (iter.data->depth == 32)
+			return vis->visual_id;
+
+		xcb_depth_next(&iter);
+	}
+
+	return scr->root_visual;
+}
+
 
